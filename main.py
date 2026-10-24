@@ -169,9 +169,9 @@ def process_worker(token: str, ms: int, limit: int | None = None):
     except Exception as e:
         print(f"[!] Background worker error: {e}")
 
-# --- Flask Server Setup ---
+# --- Flask Server Setup with CORS Enabled ---
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 @app.route('/run', methods=['POST'])
 def handle_run():
@@ -185,7 +185,7 @@ def handle_run():
 
     ms = int(hours * 3600 * 1000)
     
-    # تشغيل العمل في خلفية النظام (Background Thread)
+    # تشغيل العملية في خلفية السيرفر
     thread = threading.Thread(target=process_worker, args=(token, ms, limit))
     thread.daemon = True
     thread.start()
