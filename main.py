@@ -1,291 +1,196 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations
-
 import base64
 import json
 import os
 import sys
 import time
-import uuid
 import urllib.error
 import urllib.request
+import uuid
 import threading
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Iterator, Sequence
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-ROOT = Path(__file__).resolve().parent
-GAMES_FILE = ROOT / "data" / "games.json"
-STATE_FILE = ROOT / "science_state.json"
+ROOT = os.path.dirname(__file__)
+DATA_DIR = os.path.join(ROOT, "data")
+GAMES_PATH = os.path.join(DATA_DIR, "games.json")
+STATE_PATH = os.path.join(ROOT, "science_state.json")
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 Electron/42.7.1 Safari/537.36"
 
-ME_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
-SCIENCE_URL = "https://discord.com/api/v9/science"
-PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"
-GAMES_CDN_URL = "https://cdn.discordapp.com/detectables/games.json"
-
-BATCH_SIZE = 50
-BATCH_DELAY = 0.3
-AUTH_MAX_AGE = 12 * 3600
-DEBUG = False
-
-CLIENT_VERSION = "1.0.9253"
-CLIENT_BUILD_NUMBER = 594031
-NATIVE_BUILD_NUMBER = 88414
-OS_VERSION = "10.0.26200"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 "
-    "Electron/42.7.1 Safari/537.36"
-)
-
-class Console:
-    def ok(self, text: str) -> None: print(f"[OK] {text}")
-    def sent(self, text: str) -> None: print(f"[SYNC] {text}")
-    def warn(self, text: str) -> None: print(f"[WARN] {text}")
-    def err(self, text: str) -> None: print(f"[ERR] {text}")
-    def info(self, text: str) -> None: print(f"[INFO] {text}")
-
-@dataclass
-class State:
-    token: str = ""
-    fingerprint: str = ""
-    analytics_token: str = ""
-    fetched_at: int = 0
-
-    @property
-    def is_stale(self) -> bool:
-        return not self.analytics_token or (time.time() - self.fetched_at) > AUTH_MAX_AGE
-
-def _local_props() -> dict:
-    return {
-        "os": "Windows",
-        "browser": "Discord Client",
-        "release_channel": "stable",
-        "client_version": CLIENT_VERSION,
-        "os_version": OS_VERSION,
-        "os_arch": "x64",
-        "app_arch": "x64",
-        "system_locale": "en-GB",
-        "has_client_mods": False,
-        "browser_user_agent": USER_AGENT,
-        "browser_version": "42.7.1",
-        "os_sdk_version": "26200",
-        "client_build_number": CLIENT_BUILD_NUMBER,
-        "native_build_number": NATIVE_BUILD_NUMBER,
-        "client_event_source": None,
-        "client_app_state": "focused",
-    }
-
-def build_super_props(launch_signature: str, heartbeat_session: str) -> str:
+def req(url, headers=None, data=None, method="GET"):
+    h = {"User-Agent": UA}
+    if headers:
+        h.update(headers)
+    r = urllib.request.Request(url, headers=h, method=method)
+    if data:
+        r.data = json.dumps(data).encode("utf-8")
+        r.add_header("Content-Type", "application/json")
     try:
-        req = urllib.request.Request(PROPERTIES_URL, method="POST", data=b"{}",
-                                     headers={"content-type": "application/json", "user-agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            props = json.loads(response.read().decode("utf-8"))["properties"]
+        with urllib.request.urlopen(r, timeout=15) as res:
+            b = res.read().decode("utf-8")
+            return res.status, json.loads(b) if b else {}
+    except urllib.error.HTTPError as e:
+        return e.code, {}
     except Exception:
-        props = _local_props()
-    props["client_launch_id"] = str(uuid.uuid4())
-    props["launch_signature"] = launch_signature
-    props["client_heartbeat_session_id"] = heartbeat_session
-    raw = json.dumps(props, separators=(",", ":")).encode("utf-8")
-    return base64.b64encode(raw).decode("ascii")
+        return 0, {}
 
-def _read_analytics_token(auth_token: str) -> str:
-    req = urllib.request.Request(ME_URL, headers={"authorization": auth_token, "user-agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=15) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    token = data.get("analytics_token")
-    if not token:
-        raise RuntimeError("no analytics_token")
-    return token
+def get_super_props(sig, hb):
+    _, d = req("https://cordapi.dolfi.es/api/v2/properties/windows", method="POST")
+    props = d.get("properties") or {
+        "os": "Windows", "browser": "Discord Client", "release_channel": "stable",
+        "client_version": "1.0.9253", "os_version": "10.0.26200", "os_arch": "x64",
+        "app_arch": "x64", "system_locale": "en-GB", "has_client_mods": False,
+        "browser_user_agent": UA, "browser_version": "42.7.1", "os_sdk_version": "26200",
+        "client_build_number": 594031, "native_build_number": 88414,
+        "client_event_source": None, "client_app_state": "focused"
+    }
+    props.update({"client_launch_id": str(uuid.uuid4()), "launch_signature": sig, "client_heartbeat_session_id": hb})
+    return base64.b64encode(json.dumps(props, separators=(",", ":")).encode("utf-8")).decode("ascii")
 
-def ensure_token(state: State) -> None:
-    if not state.is_stale:
-        return
-    state.analytics_token = _read_analytics_token(state.token)
-    state.fetched_at = int(time.time())
-
-@dataclass(frozen=True)
-class Session:
-    heartbeat_session: str
-    launch_signature: str
-    super_props: str
-
-    @classmethod
-    def new(cls) -> "Session":
-        hb = str(uuid.uuid4())
-        sig = str(uuid.uuid4())
-        return cls(hb, sig, build_super_props(sig, hb))
-
-@dataclass(frozen=True)
-class Game:
-    id: str
-    name: str
-    exe: str
-
-def _download_games() -> str:
-    request = urllib.request.Request(GAMES_CDN_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        raw = response.read().decode("utf-8")
-    GAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    GAMES_FILE.write_text(raw, encoding="utf-8")
-    return raw
-
-def load_games() -> list[Game]:
-    if GAMES_FILE.exists():
-        raw = GAMES_FILE.read_text(encoding="utf-8")
-    else:
-        try:
-            raw = _download_games()
-        except Exception:
+def load_games():
+    if not os.path.exists(GAMES_PATH):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        status, data = req("https://cdn.discordapp.com/detectables/games.json")
+        if status != 200 or not data:
             return []
-    data = json.loads(raw)
-    games: list[Game] = []
-    seen: set[str] = set()
-    for entry in data:
-        gid = str(entry.get("id", ""))
-        if not gid.isdigit() or gid in seen: continue
-        exe = "game.exe"
-        for ex in entry.get("executables", []):
-            if ex.get("os") == "win32" and ex.get("name"):
-                exe = ex["name"]
-                break
-        seen.add(gid)
-        games.append(Game(gid, entry.get("name", "Unknown"), exe))
+        with open(GAMES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    else:
+        with open(GAMES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    games, seen = [], set()
+    for g in data:
+        gid = str(g.get("id", ""))
+        if not gid.isdigit() or gid in seen:
+            continue
+        exes = [e["name"] for e in g.get("executables", []) if e.get("os") == "win32" and e.get("name")]
+        if exes:
+            seen.add(gid)
+            games.append({"id": gid, "name": g.get("name", "Unknown"), "exe": exes[0]})
     return games
 
-class ScienceClient:
-    def __init__(self, state: State, session: Session) -> None:
-        self.state = state
-        self.session = session
-        self._seq = 0
-
-    def _next_seq(self) -> int:
-        self._seq += 1
-        return self._seq
-
-    def build_launch(self, game: Game) -> dict:
-        now = int(time.time() * 1000)
-        return {
-            "type": "launch_game",
-            "properties": {
-                "client_track_timestamp": now,
-                "client_heartbeat_session_id": self.session.heartbeat_session,
-                "event_sequence_number": self._next_seq(),
-                "game": game.name,
-                "game_id": game.id,
-                "verified": True,
-                "game_platform": "desktop",
-                "detection_method": "verified_game",
-                "executable_path": game.exe,
-                "launch_signature": self.session.launch_signature,
-                "client_send_timestamp": now,
-            }
+def make_events(game, ms, hb_id, sig, seq, fp=""):
+    now = int(time.time() * 1000)
+    start = max(0, now - ms)
+    sid = str(uuid.uuid4())
+    
+    seq += 1
+    hb1 = {
+        "type": "running_game_heartbeat",
+        "properties": {
+            "client_track_timestamp": start, "client_heartbeat_session_id": hb_id,
+            "event_sequence_number": seq, "game_id": game["id"], "game_name": game["name"],
+            "game_executable": game["exe"], "game_detection_enabled": True, "initial_heartbeat": True,
+            "final_heartbeat": False, "game_session_id": sid, "duration_tracked_ms": 0,
+            "launch_signature": sig, "client_app_state": "focused", "client_send_timestamp": start
         }
+    }
+    
+    seq += 1
+    launch_props = {
+        "client_track_timestamp": now, "client_heartbeat_session_id": hb_id,
+        "event_sequence_number": seq, "game": game["name"], "game_id": game["id"],
+        "verified": True, "elevated": False, "is_launcher": False, "game_platform": "desktop",
+        "detection_method": "verified_game", "is_overlay_enabled": False, "is_overlay_game_enabled": True,
+        "is_overlay_game_source": "OOP_DEFAULT_DATABASE", "fullscreen_type": "UNKNOWN",
+        "hardware_display_count": 1, "overlay_method": "Disabled", "activity_status_enabled": True,
+        "activity_status_shared_guilds": [], "current_user_status": "online", "game_detection_enabled": True,
+        "executable_path": game["exe"], "rendered_locale": "en-GB", "launch_signature": sig,
+        "client_app_state": "focused", "client_send_timestamp": now
+    }
+    if fp:
+        launch_props["executable_fingerprint"] = fp
 
-    def build_heartbeat(self, game: Game, duration_ms: int, session_id: str, initial: bool, final: bool, ts: int | None = None) -> dict:
-        ts = int(time.time() * 1000) if ts is None else ts
-        return {
-            "type": "running_game_heartbeat",
-            "properties": {
-                "client_track_timestamp": ts,
-                "client_heartbeat_session_id": self.session.heartbeat_session,
-                "event_sequence_number": self._next_seq(),
-                "game_id": game.id,
-                "game_name": game.name,
-                "game_executable": game.exe,
-                "initial_heartbeat": initial,
-                "final_heartbeat": final,
-                "game_session_id": session_id,
-                "duration_tracked_ms": duration_ms,
-                "launch_signature": self.session.launch_signature,
-                "client_send_timestamp": ts,
-            }
+    seq += 1
+    hb2 = {
+        "type": "running_game_heartbeat",
+        "properties": {
+            "client_track_timestamp": now, "client_heartbeat_session_id": hb_id,
+            "event_sequence_number": seq, "game_id": game["id"], "game_name": game["name"],
+            "game_executable": game["exe"], "game_detection_enabled": True, "initial_heartbeat": False,
+            "final_heartbeat": True, "game_session_id": sid, "duration_tracked_ms": ms,
+            "launch_signature": sig, "client_app_state": "focused", "client_send_timestamp": now
         }
+    }
+    
+    return [hb1, {"type": "launch_game", "properties": launch_props}, hb2], seq
 
-    def build_session(self, game: Game, duration_ms: int) -> list[dict]:
-        sid = str(uuid.uuid4())
-        now = int(time.time() * 1000)
-        start = now - duration_ms
-        return [
-            self.build_heartbeat(game, 0, sid, initial=True, final=False, ts=start),
-            self.build_launch(game),
-            self.build_heartbeat(game, duration_ms, sid, initial=False, final=True, ts=now),
-        ]
+def process_worker(token: str, ms: int, limit: int | None = None):
+    try:
+        st, me = req("https://discord.com/api/v9/users/@me?with_analytics_token=true", headers={"Authorization": token})
+        if st != 200 or "analytics_token" not in me:
+            print(f"[!] Auth failed for token: {st}")
+            return
+        
+        analytics_token = me["analytics_token"]
+        games = load_games()
+        if not games:
+            print("[!] No games loaded.")
+            return
 
-    def post(self, events: Sequence[dict]) -> int:
-        payload = {"token": self.state.analytics_token, "events": list(events)}
-        body = json.dumps(payload).encode("utf-8")
+        target_games = games[:limit] if limit and isinstance(limit, int) else games
+
+        hb_id, sig = str(uuid.uuid4()), str(uuid.uuid4())
+        super_props = get_super_props(sig, hb_id)
+        seq = 0
+        batch_size = 50
+        done = 0
+
         headers = {
-            "accept": "*/*",
-            "authorization": self.state.token,
-            "content-type": "application/json",
-            "user-agent": USER_AGENT,
-            "x-super-properties": self.session.super_props,
+            "Authorization": token,
+            "Accept": "*/*",
+            "Origin": "https://discord.com",
+            "Referer": "https://discord.com/channels/@me",
+            "X-Super-Properties": super_props,
+            "X-Discord-Locale": "en-GB",
+            "X-Discord-Timezone": "Europe/Oslo"
         }
-        request = urllib.request.Request(SCIENCE_URL, data=body, method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return response.status
-        except urllib.error.HTTPError as exc:
-            return exc.code
-        except Exception:
-            return 0
 
-class Spoofer:
-    def __init__(self, client: ScienceClient, console: Console) -> None:
-        self.client = client
-        self.console = console
-
-    def run(self, games: Sequence[Game], build_events) -> int:
-        sent_ok = 0
-        for start in range(0, len(games), BATCH_SIZE):
-            chunk = games[start:start + BATCH_SIZE]
+        print(f"[*] Task started for {len(target_games)} games...")
+        
+        for i in range(0, len(target_games), batch_size):
+            chunk = target_games[i:i + batch_size]
             events = []
-            for game in chunk:
-                events.extend(build_events(game))
-            status = self.client.post(events)
-            if status == 204:
-                sent_ok += len(chunk)
-            time.sleep(BATCH_DELAY)
-        return sent_ok
+            for g in chunk:
+                evs, seq = make_events(g, ms, hb_id, sig, seq)
+                events.extend(evs)
 
-# --- تطبيق السيرفر (Flask API) ---
+            st, _ = req("https://discord.com/api/v9/science", headers=headers, data={"token": analytics_token, "events": events}, method="POST")
+            if st == 204:
+                done += len(chunk)
+            elif st in (401, 403):
+                print("[!] Authorization error during process.")
+                break
+            time.sleep(0.3)
+
+        print(f"[+] Task completed. ({done}/{len(target_games)} games processed).")
+    except Exception as e:
+        print(f"[!] Background worker error: {e}")
+
+# --- Flask Server Setup ---
 app = Flask(__name__)
 CORS(app)
-
-def run_bg_task(token: str, hours: float, limit: int | None):
-    try:
-        state = State(token=token)
-        ensure_token(state)
-        session = Session.new()
-        client = ScienceClient(state, session)
-        games = load_games()
-        if limit:
-            games = games[:limit]
-        duration_ms = int(hours * 3600 * 1000)
-        spoofer = Spoofer(client, Console())
-        spoofer.run(games, lambda g: client.build_session(g, duration_ms))
-    except Exception as e:
-        print(f"Error in background: {e}")
 
 @app.route('/run', methods=['POST'])
 def handle_run():
     data = request.get_json() or {}
     token = data.get('token')
     hours = float(data.get('hours', 1))
-    limit = data.get('limit')
+    limit = data.get('games') or data.get('limit')
 
     if not token:
         return jsonify({"status": "error", "message": "Token is required"}), 400
 
-    thread = threading.Thread(target=run_bg_task, args=(token, hours, limit))
+    ms = int(hours * 3600 * 1000)
+    
+    # تشغيل العمل في خلفية النظام (Background Thread)
+    thread = threading.Thread(target=process_worker, args=(token, ms, limit))
+    thread.daemon = True
     thread.start()
 
-    return jsonify({"status": "success", "message": "Started in background!"})
+    return jsonify({"status": "success", "message": "Task launched in background!"})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
